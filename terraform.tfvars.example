@@ -1,0 +1,6 @@
+aws_region     = "us-east-1"
+environment    = "dev"
+project_name   = "secure-aws"
+instance_type  = "t3.micro"
+ami_id         = "ami-xxxxxxxxxxxxxxxxx"
+s3_bucket_name = "secure-aws-dev-app-data-example"
