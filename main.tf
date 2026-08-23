@@ -550,3 +550,211 @@ resource "aws_iam_role_policy" "ec2_s3_access" {
   role   = aws_iam_role.ec2.id
   policy = data.aws_iam_policy_document.ec2_s3_access.json
 }
+resource "aws_s3_bucket" "cloudtrail_logs" {
+  bucket = "${var.s3_bucket_name}-cloudtrail"
+
+  #checkov:skip=CKV2_AWS_62:Event notifications are outside the scope of this audit logging bucket.
+  #checkov:skip=CKV_AWS_144:Cross-region replication is outside the scope of this single-region lab and would add additional cost.
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-cloudtrail-logs"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "cloudtrail_logs" {
+  bucket = aws_s3_bucket.cloudtrail_logs.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "cloudtrail_logs" {
+  bucket = aws_s3_bucket.cloudtrail_logs.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "cloudtrail_logs" {
+  bucket = aws_s3_bucket.cloudtrail_logs.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.s3.arn
+    }
+
+    bucket_key_enabled = true
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "cloudtrail_logs" {
+  bucket = aws_s3_bucket.cloudtrail_logs.id
+
+  rule {
+    id     = "cloudtrail-retention"
+    status = "Enabled"
+
+    filter {}
+
+    noncurrent_version_expiration {
+      noncurrent_days = 365
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+}
+
+
+resource "aws_s3_bucket_logging" "cloudtrail_logs" {
+  bucket = aws_s3_bucket.cloudtrail_logs.id
+
+  target_bucket = aws_s3_bucket.access_logs.id
+  target_prefix = "cloudtrail-access-logs/"
+}
+
+data "aws_iam_policy_document" "cloudtrail_bucket_policy" {
+  statement {
+    sid    = "AWSCloudTrailAclCheck"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudtrail.amazonaws.com"]
+    }
+
+    actions = [
+      "s3:GetBucketAcl"
+    ]
+
+    resources = [
+      aws_s3_bucket.cloudtrail_logs.arn
+    ]
+  }
+
+  statement {
+    sid    = "AWSCloudTrailWrite"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudtrail.amazonaws.com"]
+    }
+
+    actions = [
+      "s3:PutObject"
+    ]
+
+    resources = [
+      "${aws_s3_bucket.cloudtrail_logs.arn}/AWSLogs/${data.aws_caller_identity.current.account_id}/*"
+    ]
+
+    condition {
+      test     = "StringEquals"
+      variable = "s3:x-amz-acl"
+      values   = ["bucket-owner-full-control"]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "cloudtrail_logs" {
+  bucket = aws_s3_bucket.cloudtrail_logs.id
+  policy = data.aws_iam_policy_document.cloudtrail_bucket_policy.json
+}
+
+
+resource "aws_cloudwatch_log_group" "cloudtrail" {
+  name              = "/aws/cloudtrail/${var.project_name}-${var.environment}"
+  retention_in_days = 365
+  kms_key_id        = aws_kms_key.vpc_flow_logs.arn
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-cloudtrail"
+  }
+}
+
+data "aws_iam_policy_document" "cloudtrail_assume_role" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudtrail.amazonaws.com"]
+    }
+
+    actions = [
+      "sts:AssumeRole"
+    ]
+  }
+}
+
+resource "aws_iam_role" "cloudtrail_cloudwatch" {
+  name               = "${var.project_name}-${var.environment}-cloudtrail-cloudwatch-role"
+  assume_role_policy = data.aws_iam_policy_document.cloudtrail_assume_role.json
+}
+
+data "aws_iam_policy_document" "cloudtrail_cloudwatch" {
+  statement {
+    effect = "Allow"
+
+    actions = [
+      "logs:CreateLogStream",
+      "logs:PutLogEvents"
+    ]
+
+    resources = [
+      "${aws_cloudwatch_log_group.cloudtrail.arn}:*"
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "cloudtrail_cloudwatch" {
+  name   = "${var.project_name}-${var.environment}-cloudtrail-cloudwatch-policy"
+  role   = aws_iam_role.cloudtrail_cloudwatch.id
+  policy = data.aws_iam_policy_document.cloudtrail_cloudwatch.json
+}
+
+resource "aws_sns_topic" "cloudtrail" {
+  name              = "${var.project_name}-${var.environment}-cloudtrail"
+  kms_master_key_id = aws_kms_key.s3.id
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-cloudtrail"
+  }
+}
+
+resource "aws_cloudtrail" "main" {
+  name                          = "${var.project_name}-${var.environment}-trail"
+  s3_bucket_name                = aws_s3_bucket.cloudtrail_logs.id
+  include_global_service_events = true
+  is_multi_region_trail         = true
+  enable_log_file_validation    = true
+  kms_key_id                    = aws_kms_key.s3.arn
+
+  cloud_watch_logs_group_arn = "${aws_cloudwatch_log_group.cloudtrail.arn}:*"
+  cloud_watch_logs_role_arn  = aws_iam_role.cloudtrail_cloudwatch.arn
+  sns_topic_name             = aws_sns_topic.cloudtrail.name
+
+  depends_on = [
+    aws_s3_bucket_policy.cloudtrail_logs
+  ]
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-cloudtrail"
+  }
+}
+
+resource "aws_guardduty_detector" "main" {
+  #checkov:skip=CKV2_AWS_3:This lab uses a standalone AWS account and does not use AWS Organizations.
+
+  enable = true
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-guardduty"
+  }
+}
